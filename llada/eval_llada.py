@@ -33,7 +33,7 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_with_jacobi
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
@@ -67,6 +67,9 @@ class LLaDAEvalHarness(LM):
         save_dir=None,
         show_speed=False,
         dual_cache=False,
+        use_jacobi=False,
+        jacobi_max_retries=3,
+        jacobi_seed=None,
         **kwargs,
     ):
         '''
@@ -132,6 +135,9 @@ class LLaDAEvalHarness(LM):
         self.save_dir = save_dir
         self.show_speed = show_speed
         self.dual_cache = dual_cache
+        self.use_jacobi = use_jacobi
+        self.jacobi_max_retries = jacobi_max_retries
+        self.jacobi_seed = jacobi_seed
     @property
     def rank(self):
         return self._rank
@@ -336,15 +342,20 @@ class LLaDAEvalHarness(LM):
 
             stop_tokens = req.args[1]['until']
             input_ids = batched_input_ids
-            if self.use_cache:
+            if self.use_jacobi:
+                # Use Jacobi decoding with fixed Gumbel noise
+                generated_answer, nfe = generate_with_jacobi(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length,
+                                    temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                                    max_retries=self.jacobi_max_retries, seed=self.jacobi_seed)
+            elif self.use_cache:
                 if self.dual_cache:
-                    generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
+                    generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length,
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
                 else:
-                    generated_answer, nfe = generate_with_prefix_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
+                    generated_answer, nfe = generate_with_prefix_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length,
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
             else:
-                generated_answer, nfe = generate(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
+                generated_answer, nfe = generate(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length,
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
 
             if self.is_instruct and 'task_id' in req.doc and str(req.doc['task_id']).lower().startswith('humaneval'):
