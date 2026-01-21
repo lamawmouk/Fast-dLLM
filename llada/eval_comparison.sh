@@ -4,6 +4,10 @@
 
 set -e
 
+# Activate the fast_dllm environment
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../fast_dllm_env/bin/activate"
+
 # Set environment variables
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_TRUST_REMOTE_CODE=true
