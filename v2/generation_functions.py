@@ -322,6 +322,239 @@ class Fast_dLLM_QwenForCausalLM:
         final_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
         yield final_text
 
+    @torch.no_grad()
+    def jacobi_sample(
+        self,
+        input_ids,
+        tokenizer,
+        block_size,
+        max_new_tokens,
+        small_block_size,
+        min_len,
+        seq_len,
+        mask_id=151665,
+        threshold=0.95,
+        stop_token=151645,
+        use_block_cache=False,
+        top_p=0.95,
+        temperature=0.0,
+        max_retries=3,
+        seed=None,
+    ):
+        """
+        Modified Jacobi sampling with fixed Gumbel noise and mismatch-based window sliding.
+
+        Key modifications from batch_sample:
+        1. Fixed Gumbel noise - generated once and reused throughout decoding
+        2. Modified token selection - argmax(logits + temp * gumbel_noise)
+        3. Window sliding on mismatch - move window to first mismatch position, max retries per block
+        """
+        num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
+        batch_size = input_ids.shape[0]
+
+        # Get vocab size for Gumbel noise
+        vocab_size = self.config.vocab_size
+
+        # Generate fixed Gumbel noise for the entire generation
+        if seed is not None:
+            torch.manual_seed(seed)
+        uniform = torch.rand((batch_size, max_new_tokens, vocab_size), device=self.device, dtype=torch.float64)
+        uniform = torch.clamp(uniform, min=1e-10, max=1.0 - 1e-10)
+        gumbel_noise = -torch.log(-torch.log(uniform))
+
+        if min_len > block_size:
+            output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
+            logits, past_key_values = output.logits, output.past_key_values
+            if min_len % block_size == 0:
+                predict_sample_idx = (seq_len == min_len)
+                predict_logits = logits[predict_sample_idx, -1:, :]
+                next_token = predict_logits.argmax(dim=-1)
+                if input_ids.shape[1] <= min_len:
+                    input_ids = torch.cat([input_ids, next_token], dim=1)
+                else:
+                    input_ids[predict_sample_idx, min_len] = next_token.squeeze(dim=-1)
+        else:
+            past_key_values = None
+
+        seq_block_idx = seq_len // block_size
+        finished_flag = torch.zeros((batch_size), device=self.device, dtype=torch.bool)
+
+        start_block_idx = min_len // block_size
+        num_small_blocks = block_size // small_block_size
+
+        sample_indices = torch.arange(batch_size, device=self.device)
+        finished_samples = {}
+        original_input_length = input_ids.shape[1]
+
+        for block_idx in range(start_block_idx, num_blocks):
+            if finished_flag.all():
+                break
+            if (seq_block_idx == block_idx).all():
+                x_init = mask_id * torch.ones((input_ids.shape[0], block_size-input_ids.shape[1]%block_size), device=self.device, dtype=torch.long)
+                x_init = torch.cat([input_ids, x_init], dim=1)
+                input_ids = x_init
+            else:
+                x_init = input_ids[:, :(block_idx + 1)*block_size]
+
+            x_init[finished_flag, -block_size:] = tokenizer.pad_token_id
+            x_t = x_init.clone()
+            x_prev = x_t.clone()
+            step = 0
+            block_past_key_values = None
+            retries = 0
+
+            while True:
+                mask_idx = (x_t[:, -block_size:] == mask_id)
+                if mask_idx.sum() == 0:
+                    for sample_idx in range(x_t.shape[0]):
+                        if finished_flag[sample_idx] and seq_len[sample_idx] < (block_idx + 1) * block_size:
+                            stop_token_idx = (x_t[sample_idx, seq_len[sample_idx]:] == stop_token).nonzero()[0][0]
+                            x_t[sample_idx, seq_len[sample_idx]+stop_token_idx+1:] = tokenizer.pad_token_id
+                    if finished_flag.all():
+                        break
+                    output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
+                    logits, past_key_values = output.logits, output.past_key_values
+                    next_token = logits[:, -1:, :].argmax(dim=-1)
+                    next_token[finished_flag] = tokenizer.pad_token_id
+                    x_t = torch.cat([x_t, next_token], dim=1)
+                    step += 1
+                    break
+
+                for small_block_idx in range(num_small_blocks):
+                    small_block_start_idx = small_block_idx * small_block_size
+                    small_block_end_idx = small_block_start_idx + small_block_size
+
+                    start = -block_size + small_block_start_idx
+                    end = None if block_size == small_block_end_idx else -block_size + small_block_end_idx
+
+                    while True:
+                        mask_idx = (x_t[:, -block_size:] == mask_id)
+                        if mask_idx[:, start:end].sum() == 0:
+                            break
+
+                        if use_block_cache:
+                            if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
+                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
+                                logits, block_past_key_values = output.logits, output.block_past_key_values
+                                logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                                logits = logits[:, start:end]
+                            else:
+                                logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
+                                logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                        else:
+                            logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                            logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                            logits = logits[:, start:end]
+
+                        # Get the Gumbel noise slice for this small block
+                        gen_offset = x_t.shape[1] - original_input_length - block_size
+                        noise_start = gen_offset + small_block_start_idx
+                        noise_end = gen_offset + small_block_end_idx
+                        noise_slice = gumbel_noise[:, noise_start:noise_end, :]
+
+                        # Select tokens using fixed Gumbel noise
+                        if temperature == 0:
+                            x_1 = torch.argmax(logits, dim=-1)
+                        else:
+                            logits_f64 = logits.to(torch.float64)
+                            perturbed = logits_f64 + temperature * noise_slice
+                            x_1 = torch.argmax(perturbed, dim=-1)
+
+                        # Compute confidence (softmax probability of selected token)
+                        if temperature > 0:
+                            logits_temp = logits / temperature
+                        else:
+                            logits_temp = logits
+                        if top_p is not None and top_p < 1:
+                            sorted_logits, sorted_indices = torch.sort(logits_temp, descending=True)
+                            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                            sorted_indices_to_remove = cumulative_probs > top_p
+                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                            sorted_indices_to_remove[..., 0] = 0
+                            mask_remove = torch.zeros_like(logits_temp, dtype=torch.bool)
+                            mask_remove = mask_remove.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+                            logits_temp = logits_temp.masked_fill(mask_remove, torch.finfo(logits_temp.dtype).min)
+
+                        p_1t = torch.softmax(logits_temp, dim=-1)
+                        x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
+                        x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
+
+                        unmask_idx = (x1_p > threshold)
+                        max_prob_idx = x1_p.argmax(dim=-1)
+                        unmask_idx[torch.arange(x_1.shape[0], device=self.device), max_prob_idx] = True
+                        unmask_idx = unmask_idx & mask_idx[:, start:end]
+
+                        x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
+
+                        finished_row_flags = ((x_1 == stop_token) & unmask_idx).any(dim=1)
+                        finished_flag = finished_flag | finished_row_flags
+
+                        step += 1
+
+                        # Mismatch detection
+                        block_start_abs = x_t.shape[1] - block_size
+                        block_end_abs = x_t.shape[1]
+                        block_prev = x_prev[:, block_start_abs:block_end_abs]
+                        block_curr = x_t[:, block_start_abs:block_end_abs]
+                        was_unmasked = (block_prev != mask_id)
+                        mismatch = was_unmasked & (block_prev != block_curr)
+                        has_mismatch = mismatch.any(dim=1)
+
+                        if has_mismatch.any() and retries < max_retries:
+                            # Find first mismatch position
+                            positions = torch.arange(block_size, device=self.device).unsqueeze(0).expand(batch_size, -1)
+                            mismatch_positions = torch.where(mismatch, positions, torch.full_like(positions, block_size))
+                            first_mismatch_relative = mismatch_positions.min(dim=1).values
+
+                            # Re-mask from first mismatch to end
+                            for b in range(x_t.shape[0]):
+                                if has_mismatch[b]:
+                                    mismatch_pos = first_mismatch_relative[b].item()
+                                    x_t[b, block_start_abs + mismatch_pos:block_end_abs] = mask_id
+                            retries += 1
+                        else:
+                            x_prev = x_t.clone()
+                            retries = 0
+
+            if input_ids.shape[1] == x_t.shape[1]:
+                input_ids = x_t
+            else:
+                input_ids[:, :(block_idx + 1)*block_size] = x_t[:, :-1]
+                if (seq_block_idx == block_idx).all():
+                    input_ids = torch.cat([input_ids, x_t[:, -1:]], dim=1)
+                else:
+                    if input_ids.shape[1] <= (block_idx + 1)*block_size:
+                        input_ids = x_t
+                    else:
+                        input_ids[seq_block_idx == block_idx, (block_idx + 1)*block_size] = x_t[seq_block_idx == block_idx, (block_idx + 1)*block_size]
+            seq_block_idx[seq_block_idx == block_idx] = block_idx + 1
+            if finished_flag.any():
+                for sample_idx in range(x_t.shape[0]):
+                    if finished_flag[sample_idx]:
+                        original_idx = sample_indices[sample_idx].item()
+                        finished_samples[original_idx] = x_t[sample_idx:sample_idx+1].clone().squeeze(dim=0)
+                sample_indices = sample_indices[~finished_flag]
+                input_ids = input_ids[~finished_flag]
+                seq_block_idx = seq_block_idx[~finished_flag]
+                seq_len = seq_len[~finished_flag]
+                x_t = x_t[~finished_flag]
+                gumbel_noise = gumbel_noise[~finished_flag]
+
+                for layer_id in range(len(past_key_values)):
+                    past_key_values.key_cache[layer_id] = past_key_values.key_cache[layer_id][~finished_flag]
+                    past_key_values.value_cache[layer_id] = past_key_values.value_cache[layer_id][~finished_flag]
+
+                finished_flag = finished_flag[~finished_flag]
+
+        # Add not finished samples since max_new_tokens is reached
+        if len(finished_samples) < batch_size:
+            for sample_idx in range(x_t.shape[0]):
+                original_idx = sample_indices[sample_idx].item()
+                finished_samples[original_idx] = x_t[sample_idx:sample_idx+1].clone().squeeze(dim=0)
+
+        assert len(finished_samples) == batch_size
+        return finished_samples
+
 
 def setup_model_with_custom_generation(model):
     """
@@ -329,4 +562,6 @@ def setup_model_with_custom_generation(model):
     """
     # Add mdm_sample method with visualization
     model.mdm_sample_with_visualization = types.MethodType(Fast_dLLM_QwenForCausalLM.mdm_sample_with_visualization, model)
+    # Add jacobi_sample method
+    model.jacobi_sample = types.MethodType(Fast_dLLM_QwenForCausalLM.jacobi_sample, model)
     return model

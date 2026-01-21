@@ -94,6 +94,80 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
     return confidence, x0
 
 
+def generate_fixed_gumbel_noise(shape, device, dtype=torch.float64, seed=None):
+    """Generate fixed Gumbel(0,1) noise for deterministic decoding."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    uniform = torch.rand(shape, device=device, dtype=dtype)
+    uniform = torch.clamp(uniform, min=1e-10, max=1.0 - 1e-10)
+    return -torch.log(-torch.log(uniform))
+
+
+def select_tokens_with_fixed_gumbel(logits, gumbel_noise, temperature):
+    """Select tokens via argmax(logits + temp * gumbel_noise)."""
+    if temperature == 0:
+        return torch.argmax(logits, dim=-1)
+    logits_f64 = logits.to(torch.float64)
+    perturbed = logits_f64 + temperature * gumbel_noise
+    return torch.argmax(perturbed, dim=-1)
+
+
+def jacobi_sample_tokens(logits, gumbel_noise, temperature=0.0, top_p=None, top_k=None):
+    """
+    Sample tokens using fixed Gumbel noise for Jacobi iteration.
+
+    Returns:
+        confidence: (B, L) confidence scores
+        x0: (B, L) sampled tokens
+    """
+    if temperature > 0:
+        logits = logits / temperature
+    if top_p is not None and top_p < 1:
+        logits = top_p_logits(logits, top_p)
+    if top_k is not None:
+        logits = top_k_logits(logits, top_k)
+
+    probs = torch.softmax(logits, dim=-1)
+
+    # Use fixed Gumbel noise for token selection
+    x0 = select_tokens_with_fixed_gumbel(logits, gumbel_noise, temperature)
+    confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
+
+    return confidence, x0
+
+
+def detect_mismatch_positions(x_prev, x_curr, mask_token_id, start_idx, end_idx):
+    """Detect first mismatch position between iterations.
+
+    A mismatch is when a previously unmasked token changes value.
+    """
+    B, device = x_prev.shape[0], x_prev.device
+    block_prev = x_prev[:, start_idx:end_idx]
+    block_curr = x_curr[:, start_idx:end_idx]
+    was_unmasked = (block_prev != mask_token_id)
+    mismatch = was_unmasked & (block_prev != block_curr)
+    positions = torch.arange(end_idx - start_idx, device=device).unsqueeze(0).expand(B, -1)
+    mismatch_positions = torch.where(mismatch, positions, torch.full_like(positions, end_idx - start_idx))
+    first_mismatch_relative = mismatch_positions.min(dim=1).values
+    has_mismatch = mismatch.any(dim=1)
+    first_mismatch_pos = torch.where(has_mismatch, first_mismatch_relative + start_idx,
+                                      torch.full((B,), -1, device=device, dtype=torch.long))
+    return has_mismatch, first_mismatch_pos
+
+
+def slide_window_to_mismatch(x, first_mismatch_pos, start_idx, end_idx, mask_token_id, has_mismatch):
+    """Slide window to first mismatch, re-mask from mismatch to end."""
+    if not has_mismatch.any():
+        return start_idx, end_idx, x
+    valid_pos = torch.where(has_mismatch, first_mismatch_pos, torch.full_like(first_mismatch_pos, end_idx))
+    new_start = valid_pos.min().item()
+    x_updated = x.clone()
+    for b in range(x.shape[0]):
+        if has_mismatch[b]:
+            x_updated[b, first_mismatch_pos[b].item():end_idx] = mask_token_id
+    return new_start, end_idx, x_updated
+
+
 @dataclass
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
@@ -496,6 +570,230 @@ class DreamGenerationMixin:
                 histories.append(x.clone())
             i += 1
         
+        print(f'used steps: {steps}')
+        end_time = time.time()
+        print(f'used time: {end_time - start_time}')
+        if return_dict_in_generate:
+            return DreamModelOutput(
+                sequences=x,
+                history=histories,
+            )
+        else:
+            return x
+
+    @torch.no_grad()
+    def diffusion_generate_jacobi(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        generation_config: Optional[DreamGenerationConfig] = None,
+        max_retries: int = 3,
+        seed: Optional[int] = None,
+        **kwargs,
+    ) -> Union[DreamModelOutput, torch.LongTensor]:
+        """
+        Modified Jacobi decoding with fixed Gumbel noise and mismatch-based window sliding.
+
+        Args:
+            inputs: Input tensor.
+            generation_config: Generation configuration.
+            max_retries: Maximum retries per block on mismatch.
+            seed: Random seed for reproducible Gumbel noise.
+        """
+        # 1. Handle `generation_config` and kwargs that might update it
+        generation_config = self._prepare_generation_config(generation_config, **kwargs)
+        generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
+        generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
+
+        # 2. Define model inputs
+        assert inputs is not None
+        input_ids = inputs
+        device = input_ids.device
+        attention_mask = kwargs.pop("attention_mask", None)
+        self._prepare_special_tokens(generation_config, device=device)
+
+        # 3. Prepare `max_length`.
+        input_ids_length = input_ids.shape[-1]
+        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+        generation_config = self._prepare_generated_length(
+            generation_config=generation_config,
+            has_default_max_length=has_default_max_length,
+            input_ids_length=input_ids_length,
+        )
+
+        self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+
+        # 4. Check input_ids
+        if not is_torchdynamo_compiling() and self.device.type != input_ids.device.type:
+            warnings.warn(
+                "You are calling .generate() with the `input_ids` being on a device type different"
+                f" than your model's device. `input_ids` is on {input_ids.device.type}, whereas the model"
+                f" is on {self.device.type}.",
+                UserWarning,
+            )
+        if (
+            hasattr(generation_config, "pad_token_id") and
+            torch.any(input_ids == generation_config.pad_token_id) and
+            attention_mask is None
+        ):
+            warnings.warn(
+                "Padding was detected but no attention mask is passed here.",
+                UserWarning,
+            )
+
+        input_ids, attention_mask = self._expand_inputs_for_generation(
+            expand_size=generation_config.num_return_sequences,
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        threshold = kwargs.get("threshold", 0.9)
+
+        result = self._sample_jacobi(
+            input_ids,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            generation_tokens_hook_func=generation_tokens_hook_func,
+            generation_logits_hook_func=generation_logits_hook_func,
+            threshold=threshold,
+            max_retries=max_retries,
+            seed=seed
+        )
+        return result
+
+    def _sample_jacobi(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor],
+        generation_config: DreamGenerationConfig,
+        generation_tokens_hook_func,
+        generation_logits_hook_func,
+        threshold: Optional[float] = 0.9,
+        max_retries: int = 3,
+        seed: Optional[int] = None
+    ) -> Union[DreamModelOutput, torch.LongTensor]:
+        """
+        Modified Jacobi sampling with fixed Gumbel noise and mismatch detection.
+        """
+        # init values
+        output_history = generation_config.output_history
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        max_length = generation_config.max_length
+        mask_token_id = generation_config.mask_token_id
+        steps = generation_config.steps
+        eps = generation_config.eps
+        temperature = generation_config.temperature
+        top_p = generation_config.top_p
+        top_k = generation_config.top_k
+
+        histories = [] if (return_dict_in_generate and output_history) else None
+        start_time = time.time()
+
+        # pad input_ids to max_length
+        input_ids_length = input_ids.shape[-1]
+        gen_length = max_length - input_ids_length
+        x = F.pad(input_ids, (0, gen_length), value=mask_token_id)
+
+        if attention_mask is not None and torch.any(attention_mask == 0.0):
+            attention_mask = F.pad(attention_mask, (0, gen_length), value=1.0)
+            tok_idx = attention_mask.long().cumsum(-1) - 1
+            tok_idx.masked_fill_(attention_mask == 0, 1)
+            attention_mask = torch.logical_and(
+                attention_mask.unsqueeze(1).unsqueeze(-2),
+                attention_mask.unsqueeze(1).unsqueeze(-1),
+            )
+        else:
+            tok_idx = None
+            attention_mask = "full"
+
+        # Get vocab size for Gumbel noise
+        vocab_size = self.config.vocab_size
+
+        # Generate fixed Gumbel noise for the entire generation length
+        gumbel_noise = generate_fixed_gumbel_noise(
+            (x.shape[0], gen_length, vocab_size), device=self.device, seed=seed
+        )
+
+        timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+
+        # Allow user-defined token control
+        x = generation_tokens_hook_func(None, x, None)
+
+        x_prev = x.clone()
+        retries = 0
+        i = 0
+
+        while i < steps:
+            mask_index = (x == mask_token_id)
+            logits = self(x, attention_mask, tok_idx).logits
+            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+            # Allow user-defined logits control
+            logits = generation_logits_hook_func(i, x, logits)
+
+            mask_logits = logits[mask_index]
+
+            t = timesteps[i]
+            s = timesteps[i + 1]
+
+            # Get the Gumbel noise slice for masked positions
+            # We need to index into the gen_length portion
+            gen_mask_index = mask_index[:, input_ids_length:]  # (B, gen_length)
+
+            # Use fixed Gumbel noise for token selection
+            confidence, x0 = jacobi_sample_tokens(
+                mask_logits,
+                gumbel_noise[:, :gen_mask_index.shape[1], :][gen_mask_index],
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k
+            )
+
+            # Confidence threshold based transfer
+            if threshold is not None:
+                x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
+                x_[mask_index] = x0.clone()
+                full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
+                full_confidence[mask_index] = confidence
+
+                # Transfer positions above threshold
+                transfer_mask = (full_confidence >= threshold) & mask_index
+
+                # Force at least one token to be transferred (highest confidence)
+                max_conf_indices = torch.argmax(full_confidence, dim=1, keepdim=True)
+                force_mask = torch.zeros_like(transfer_mask).scatter_(1, max_conf_indices, True)
+                transfer_mask = (transfer_mask | force_mask) & mask_index
+
+                x[transfer_mask] = x_[transfer_mask].clone()
+            else:
+                # Original probability-based transfer
+                p_transfer = 1 - s / t if i < steps - 1 else 1
+                x0_full = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
+                transfer_index_t_s = torch.rand(*x0_full.shape, device=self.device) < p_transfer
+                x0_full[transfer_index_t_s] = x0[transfer_index_t_s]
+                x[mask_index] = x0_full.clone()
+
+            # Mismatch detection
+            has_mismatch, first_mismatch_pos = detect_mismatch_positions(
+                x_prev, x, mask_token_id, input_ids_length, max_length
+            )
+
+            if has_mismatch.any() and retries < max_retries:
+                # Slide window to mismatch position and re-mask
+                _, _, x = slide_window_to_mismatch(
+                    x, first_mismatch_pos, input_ids_length, max_length, mask_token_id, has_mismatch
+                )
+                retries += 1
+            else:
+                # No mismatch or max retries reached
+                x_prev = x.clone()
+                retries = 0
+                i += 1
+
+            # Allow user-defined token control
+            x = generation_tokens_hook_func(i, x, logits)
+
+            if histories is not None:
+                histories.append(x.clone())
+
         print(f'used steps: {steps}')
         end_time = time.time()
         print(f'used time: {end_time - start_time}')
