@@ -60,6 +60,9 @@ class Fast_dLLM_v2EvalHarness(LM):
         small_block_size=8,
         bd_size=32,
         threshold=0.9,
+        use_jacobi=False,
+        jacobi_max_retries=3,
+        jacobi_seed=None,
         **kwargs,
     ):
 
@@ -83,7 +86,11 @@ class Fast_dLLM_v2EvalHarness(LM):
         )
         self.model.eval()
 
-        self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample, self.model)
+        # Use jacobi_sample or batch_sample based on use_jacobi flag
+        if use_jacobi:
+            self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.jacobi_sample, self.model)
+        else:
+            self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample, self.model)
 
         self.device = torch.device(device)
         if self.accelerator is not None:
@@ -107,6 +114,9 @@ class Fast_dLLM_v2EvalHarness(LM):
         self.small_block_size = small_block_size
         self.threshold = threshold
         self.bd_size = bd_size
+        self.use_jacobi = use_jacobi
+        self.jacobi_max_retries = jacobi_max_retries
+        self.jacobi_seed = jacobi_seed
 
     @property
     def rank(self):
@@ -249,31 +259,31 @@ class Fast_dLLM_v2EvalHarness(LM):
             batched_input_ids = batched_input_ids.to(self.device)
             
             with torch.no_grad():
+                # Build kwargs for mdm_sample (includes jacobi params if use_jacobi is True)
+                sample_kwargs = dict(
+                    tokenizer=self.tokenizer,
+                    block_size=self.bd_size,
+                    small_block_size=self.small_block_size,
+                    max_new_tokens=self.max_new_tokens,
+                    mask_id=self.mask_id,
+                    min_len=min_len,
+                    seq_len=torch.tensor(seq_len, device=self.device),
+                    use_block_cache=self.use_block_cache,
+                    threshold=self.threshold,
+                )
+                if self.use_jacobi:
+                    sample_kwargs['max_retries'] = self.jacobi_max_retries
+                    sample_kwargs['seed'] = self.jacobi_seed
+
                 if self.accelerator is not None:
                     generated_ids = self.accelerator.unwrap_model(self.model).mdm_sample(
                         batched_input_ids,
-                        tokenizer=self.tokenizer,
-                        block_size=self.bd_size,
-                        small_block_size=self.small_block_size,
-                        max_new_tokens=self.max_new_tokens,
-                        mask_id=self.mask_id,
-                        min_len=min_len,
-                        seq_len=torch.tensor(seq_len, device=self.device),
-                        use_block_cache=self.use_block_cache,
-                        threshold=self.threshold,
+                        **sample_kwargs,
                     )
                 else:
                     generated_ids = self.model.mdm_sample(
                         batched_input_ids,
-                        tokenizer=self.tokenizer,
-                        block_size=self.bd_size,
-                        small_block_size=self.small_block_size,
-                        max_new_tokens=self.max_new_tokens,
-                        mask_id=self.mask_id,
-                        min_len=min_len,
-                        seq_len=torch.tensor(seq_len, device=self.device),
-                        use_block_cache=self.use_block_cache,
-                        threshold=self.threshold,
+                        **sample_kwargs,
                     )
             
             # extract new generated tokens, and keep original index order
