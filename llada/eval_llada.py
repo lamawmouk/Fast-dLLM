@@ -70,6 +70,7 @@ class LLaDAEvalHarness(LM):
         use_jacobi=False,
         jacobi_max_retries=3,
         jacobi_seed=None,
+        jacobi_temperature=0.1,  # Non-zero to enable Gumbel noise
         **kwargs,
     ):
         '''
@@ -138,6 +139,7 @@ class LLaDAEvalHarness(LM):
         self.use_jacobi = use_jacobi
         self.jacobi_max_retries = jacobi_max_retries
         self.jacobi_seed = jacobi_seed
+        self.jacobi_temperature = jacobi_temperature
     @property
     def rank(self):
         return self._rank
@@ -344,8 +346,9 @@ class LLaDAEvalHarness(LM):
             input_ids = batched_input_ids
             if self.use_jacobi:
                 # Use Jacobi decoding with fixed Gumbel noise
+                # Note: temperature must be non-zero for Gumbel noise to have effect
                 generated_answer, nfe = generate_with_jacobi(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length,
-                                    temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                                    temperature=self.jacobi_temperature, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
                                     max_retries=self.jacobi_max_retries, seed=self.jacobi_seed)
             elif self.use_cache:
                 if self.dual_cache:
