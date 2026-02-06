@@ -135,6 +135,55 @@ For detailed evaluation instructions on GSM8K and HumanEval benchmarks, please r
 
 For detailed evaluation instructions on GSM8K and HumanEval benchmarks, please refer to [Dream Evaluation Guide](dream/eval.md).
 
+## Jacobi y* Reference Sequence Decoding
+
+This fork adds **Jacobi y* decoding** — a fixed-point iteration scheme for diffusion LLMs where a reference sequence y* guides convergence and mismatch detection.
+
+### How it works
+
+1. Initialize `y* = [prompt | MASK MASK ... MASK]`
+2. Each iteration runs a model forward pass, selects high-confidence tokens, and compares the result against y*:
+   - **No mismatch** (or retries exhausted): `y* = y^(k+1)` — the new prediction becomes the reference
+   - **Mismatch detected** (a previously-unmasked token changed value): re-mask from the first mismatch position and retry without updating y*
+3. Uses **fixed Gumbel noise** generated once and reused across all iterations for deterministic token selection
+
+### Files
+
+All custom Jacobi code lives in a single standalone module — the upstream NVIDIA model files are untouched:
+
+| File | Description |
+|------|-------------|
+| `jacobi_ystar_decoding.py` | Standalone module with Jacobi y* decoding for all 3 backends |
+| `llada/eval_llada.py` | LLaDA eval script (imports `generate_with_jacobi` from the standalone module) |
+| `v2/eval.py` | Fast-dLLM v2 eval script (imports `JacobiYstarV2.jacobi_sample` from the standalone module) |
+
+### Interfaces provided
+
+- **LLaDA**: `generate_with_jacobi(model, prompt, steps, gen_length, block_length, temperature, remasking, mask_id, threshold, factor, max_retries, seed)` — returns `(x, nfe)`
+- **LLaDA sliding window**: `generate_with_sliding_window_jacobi(model, prompt, gen_length, window_size, ...)` — returns `(x, nfe)`
+- **Fast-dLLM v2**: `JacobiYstarV2.jacobi_sample(self, input_ids, tokenizer, block_size, ...)` — same signature/return as `batch_sample()`
+- **Dream**: `DreamJacobiMixin.diffusion_generate_jacobi(self, inputs, generation_config, max_retries, seed, ...)` — returns `DreamModelOutput`
+
+### Usage
+
+To run LLaDA eval with Jacobi decoding:
+```bash
+cd llada
+bash eval_jacobi.sh
+```
+
+To run v2 eval with Jacobi decoding:
+```bash
+cd v2
+bash eval_jacobi.sh
+```
+
+Key parameters:
+- `use_jacobi=True` — enables Jacobi y* decoding
+- `jacobi_max_retries` — max retries on mismatch before forcing y* update (default: 3)
+- `jacobi_seed` — seed for fixed Gumbel noise (deterministic across iterations)
+- `jacobi_temperature` — temperature for Gumbel-perturbed token selection (LLaDA)
+
 ## Contributing
 
 Issues and Pull Requests are welcome!
