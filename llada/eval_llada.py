@@ -33,7 +33,10 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_with_jacobi
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+from jacobi_ystar_decoding import generate_with_jacobi
 from model.modeling_llada import LLaDAModelLM
 import json
 import time

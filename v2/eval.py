@@ -35,7 +35,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import json
 import time
 import types
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import generation_functions
+from jacobi_ystar_decoding import JacobiYstarV2
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -88,7 +91,7 @@ class Fast_dLLM_v2EvalHarness(LM):
 
         # Use jacobi_sample or batch_sample based on use_jacobi flag
         if use_jacobi:
-            self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.jacobi_sample, self.model)
+            self.model.mdm_sample = types.MethodType(JacobiYstarV2.jacobi_sample, self.model)
         else:
             self.model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample, self.model)
 
